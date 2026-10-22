@@ -1,0 +1,35 @@
+name: Test macOS DMG (tray)
+
+on:
+  push:
+    branches: ["test/macos-dmg-tray"]
+
+jobs:
+  build-dmg:
+    runs-on: macos-15-intel
+    env:
+      LIB_HOME: /usr/local
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: git fetch --tags https://github.com/pactus-project/pactus.git
+
+      - name: Install Dependencies
+        run: brew install gtk4 create-dmg coreutils gdk-pixbuf librsvg glib-networking pkg-config gobject-introspection gtksourceview5 libadwaita
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.27.1"
+
+      - name: Create release files
+        run: bash ./.github/releasers/releaser_gui_macos.sh
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: pactus-gui-macos-amd64-tray
+          path: pactus-*.dmg
