@@ -81,6 +81,18 @@ const (
 	mfGrayed    = 0x00000001
 )
 
+// SetMenuItemInfoW fMask flags.
+const (
+	miimState  = 0x00000001
+	miimString = 0x00000040
+)
+
+// SetMenuItemInfoW fState flags.
+const (
+	mfsChecked  = 0x00000008
+	mfsDisabled = 0x00000003
+)
+
 // HWND_MESSAGE parent for message-only windows.
 const hwndMessage = ^uintptr(2) // (HWND)-3 = HWND_MESSAGE
 
@@ -107,10 +119,10 @@ var (
 	shell32  = windows.NewLazySystemDLL("shell32.dll")
 	kernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procShellNotifyIconW            = shell32.NewProc("Shell_NotifyIconW")
-	procRegisterClassExW            = user32.NewProc("RegisterClassExW")
-	procCreateWindowExW             = user32.NewProc("CreateWindowExW")
-	procDestroyWindow               = user32.NewProc("DestroyWindow")
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+	procRegisterClassExW = user32.NewProc("RegisterClassExW")
+	procCreateWindowExW  = user32.NewProc("CreateWindowExW")
+
 	procDefWindowProcW              = user32.NewProc("DefWindowProcW")
 	procSetForegroundWindow         = user32.NewProc("SetForegroundWindow")
 	procTrackPopupMenu              = user32.NewProc("TrackPopupMenu")
@@ -129,7 +141,25 @@ var (
 	procTranslateMessage            = user32.NewProc("TranslateMessage")
 	procDispatchMessageW            = user32.NewProc("DispatchMessageW")
 	procShellNotifyIconGetRect      = shell32.NewProc("Shell_NotifyIconGetRect")
+	procSetMenuItemInfoW            = user32.NewProc("SetMenuItemInfoW")
+	procPostQuitMessage             = user32.NewProc("PostQuitMessage")
 )
+
+// menuItemInfoW is the Win32 MENUITEMINFOW structure for SetMenuItemInfoW.
+type menuItemInfoW struct {
+	cbSize        uint32
+	fMask         uint32
+	fType         uint32
+	fState        uint32
+	wID           uint32
+	hSubMenu      uintptr
+	hbmpChecked   uintptr
+	hbmpUnchecked uintptr
+	dwItemData    uintptr
+	dwTypeData    uintptr
+	cch           uint32
+	hbmpItem      uintptr
+}
 
 // msg is the Win32 MSG structure for the message loop.
 type msg struct {
@@ -225,14 +255,23 @@ type win32Tray struct {
 	iconDark []byte  // dark mode icon PNG for automatic theme switching
 	tooltip  string  // stored tooltip for explorer crash recovery
 
-	callbacks *Callbacks
-	menu      *Menu // stored menu for rebuilding HMENU and dispatch
+	callbacks  *Callbacks
+	menu       *Menu                // stored menu for rebuilding HMENU and dispatch
+	itemIDs    map[uint32]uint32    // MenuItem.ID() -> HMENU command ID (UINT) for UpdateItem
+	itemHMenus map[uint32]uintptr   // MenuItem.ID() -> owning HMENU handle (for submenu UpdateItem)
+	itemPos    map[uint32]uint32    // MenuItem.ID() -> position within owning HMENU (submenu containers, fByPosition lookup)
+	cmdItems   map[uint32]*MenuItem // command ID -> MenuItem for click dispatch (flat, includes submenus)
+	nextCmdID  uint32               // global command ID counter (1-based, increments across submenus)
 }
 
 // NewPlatformTray creates a Win32 system tray implementation.
 func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 	return &win32Tray{
-		callbacks: callbacks,
+		callbacks:  callbacks,
+		itemIDs:    make(map[uint32]uint32),
+		itemHMenus: make(map[uint32]uintptr),
+		itemPos:    make(map[uint32]uint32),
+		cmdItems:   make(map[uint32]*MenuItem),
 	}
 }
 
@@ -410,6 +449,11 @@ func (t *win32Tray) SetTooltip(text string) error {
 // SetMenu stores the menu for context menu display on right-click.
 func (t *win32Tray) SetMenu(menu *Menu) error {
 	t.menu = menu
+	t.itemIDs = make(map[uint32]uint32)
+	t.itemHMenus = make(map[uint32]uintptr)
+	t.itemPos = make(map[uint32]uint32)
+	t.cmdItems = make(map[uint32]*MenuItem)
+	t.nextCmdID = 1
 
 	// Destroy old HMENU if any.
 	if t.hmenu != 0 {
@@ -420,7 +464,7 @@ func (t *win32Tray) SetMenu(menu *Menu) error {
 	}
 
 	if menu != nil && len(menu.Items) > 0 {
-		hmenu, err := buildHMENU(menu)
+		hmenu, err := t.buildHMENU(menu)
 		if err != nil {
 			return fmt.Errorf("build HMENU: %w", err)
 		}
@@ -564,7 +608,7 @@ func (t *win32Tray) Bounds() (int, int, int, int) {
 }
 
 // Run blocks the calling goroutine, pumping the Win32 message loop.
-// Returns when PostQuitMessage is called (via Quit or WM_DESTROY).
+// Returns when PostQuitMessage is called after the last tray is destroyed.
 // All enterprise references (Qt6, getlantern/systray, fyne-io/systray)
 // use GetMessage — 0% CPU when idle, correct WM_QUIT semantics.
 func (t *win32Tray) Run() error {
@@ -586,6 +630,8 @@ func (t *win32Tray) Run() error {
 }
 
 // Destroy removes the tray icon, destroys the window, and frees resources.
+// Safe to call from any goroutine — uses PostMessage to dispatch to the
+// window's thread where DestroyWindow is called via WM_DESTROY handler.
 func (t *win32Tray) Destroy() {
 	// Remove icon from tray.
 	if t.visible {
@@ -594,33 +640,16 @@ func (t *win32Tray) Destroy() {
 		}
 	}
 
-	// Unregister from the global registry.
+	// Post WM_CLOSE to the window. This is thread-safe (PostMessage works from
+	// any thread). DefWindowProc handles WM_CLOSE by calling DestroyWindow on
+	// the correct thread. The final tray's WM_DESTROY posts WM_QUIT so Run exits.
 	if t.hwnd != 0 {
-		trayMu.Lock()
-		delete(trayRegistry, t.hwnd)
-		trayMu.Unlock()
-
-		if ret, _, _ := procDestroyWindow.Call(t.hwnd); ret == 0 {
-			slog.Warn("systray: DestroyWindow failed during cleanup")
+		ret, _, _ := procPostMessageW.Call(t.hwnd, 0x0010, 0, 0) // WM_CLOSE = 0x0010
+		if ret == 0 {
+			slog.Warn("systray: PostMessage WM_CLOSE failed during Destroy")
 		}
-		t.hwnd = 0
 	}
-
-	// Free HICON.
-	if t.hicon != 0 {
-		if ret, _, _ := procDestroyIcon.Call(t.hicon); ret == 0 {
-			slog.Warn("systray: DestroyIcon failed during cleanup")
-		}
-		t.hicon = 0
-	}
-
-	// Free HMENU.
-	if t.hmenu != 0 {
-		if ret, _, _ := procDestroyMenu.Call(t.hmenu); ret == 0 {
-			slog.Warn("systray: DestroyMenu failed during cleanup")
-		}
-		t.hmenu = 0
-	}
+	// Registry cleanup, HICON/HMENU free in WM_DESTROY handler (correct thread).
 }
 
 // makeNID builds a NOTIFYICONDATAW with current state.
@@ -692,15 +721,14 @@ func (t *win32Tray) reAddIcon() {
 // --- Menu construction ---
 
 // buildHMENU creates a Win32 HMENU from the internal Menu structure.
-// Menu item IDs are 1-based sequential (0 is reserved for "no selection"
-// in TrackPopupMenu with TPM_RETURNCMD).
-func buildHMENU(menu *Menu) (uintptr, error) {
+// Command IDs are globally unique across all submenus (allocated from t.nextCmdID).
+func (t *win32Tray) buildHMENU(menu *Menu) (uintptr, error) {
 	hmenu, _, _ := procCreatePopupMenu.Call()
 	if hmenu == 0 {
 		return 0, fmt.Errorf("CreatePopupMenu failed")
 	}
 
-	if err := populateMenu(hmenu, menu); err != nil {
+	if err := t.populateMenu(hmenu, menu); err != nil {
 		if ret, _, _ := procDestroyMenu.Call(hmenu); ret == 0 {
 			slog.Warn("systray: DestroyMenu failed during error cleanup")
 		}
@@ -711,11 +739,13 @@ func buildHMENU(menu *Menu) (uintptr, error) {
 }
 
 // populateMenu recursively adds items to an HMENU.
-// Item IDs are assigned sequentially using a global counter that resets
-// when buildHMENU is called. For submenus, items continue the sequence.
-func populateMenu(hmenu uintptr, menu *Menu) error {
+// Each non-separator, non-submenu item gets a globally unique command ID
+// from t.nextCmdID, ensuring submenus dispatch correctly.
+func (t *win32Tray) populateMenu(hmenu uintptr, menu *Menu) error {
+	pos := 0
 	for i, item := range menu.Items {
-		switch item.Type {
+		snapshot := item.snapshot()
+		switch snapshot.itemType {
 		case MenuItemSeparator:
 			ret, _, _ := procAppendMenuW.Call(
 				hmenu,
@@ -726,23 +756,23 @@ func populateMenu(hmenu uintptr, menu *Menu) error {
 			if ret == 0 {
 				return fmt.Errorf("AppendMenuW separator failed at index %d", i)
 			}
+			pos++
 
 		case MenuItemSubmenu:
 			if item.Submenu == nil {
 				continue
 			}
-			subHMenu, err := buildHMENU(item.Submenu)
+			subHMenu, err := t.buildHMENU(item.Submenu)
 			if err != nil {
-				return fmt.Errorf("build submenu %q: %w", item.Label, err)
+				return fmt.Errorf("build submenu %q: %w", snapshot.label, err)
 			}
-			label, err := windows.UTF16PtrFromString(item.Label)
+			label, err := windows.UTF16PtrFromString(snapshot.label)
 			if err != nil {
-				// Best-effort cleanup of already-created submenu handle.
 				_, _, _ = procDestroyMenu.Call(subHMenu)
-				return fmt.Errorf("utf16 submenu label %q: %w", item.Label, err)
+				return fmt.Errorf("utf16 submenu label %q: %w", snapshot.label, err)
 			}
 			flags := uintptr(mfString | mfPopup)
-			if item.Disabled {
+			if snapshot.disabled {
 				flags |= mfGrayed
 			}
 			ret, _, _ := procAppendMenuW.Call(
@@ -752,36 +782,105 @@ func populateMenu(hmenu uintptr, menu *Menu) error {
 				uintptr(unsafe.Pointer(label)),
 			)
 			if ret == 0 {
-				// Best-effort cleanup of already-created submenu handle.
 				_, _, _ = procDestroyMenu.Call(subHMenu)
-				return fmt.Errorf("AppendMenuW submenu %q failed", item.Label)
+				return fmt.Errorf("AppendMenuW submenu %q failed", snapshot.label)
 			}
 
+			// MF_POPUP items carry the submenu HMENU in the ID slot instead of
+			// a command ID, so SetMenuItemInfoW cannot find them by ID. Record
+			// the owning HMENU and position for fByPosition-based updates.
+			t.itemHMenus[item.ID()] = hmenu
+			t.itemPos[item.ID()] = uint32(pos)
+			pos++
+
 		default: // MenuItemNormal, MenuItemCheckbox
-			label, err := windows.UTF16PtrFromString(item.Label)
+			label, err := windows.UTF16PtrFromString(snapshot.label)
 			if err != nil {
-				return fmt.Errorf("utf16 menu label %q: %w", item.Label, err)
+				return fmt.Errorf("utf16 menu label %q: %w", snapshot.label, err)
 			}
 			flags := uintptr(mfString)
-			if item.Checked {
+			if snapshot.checked {
 				flags |= mfChecked
 			}
-			if item.Disabled {
+			if snapshot.disabled {
 				flags |= mfGrayed
 			}
-			// Item ID is 1-based index for flat lookup via collectItems.
-			itemID := uintptr(i + 1)
+			cmdID := t.nextCmdID
+			t.nextCmdID++
 			ret, _, _ := procAppendMenuW.Call(
 				hmenu,
 				flags,
-				itemID,
+				uintptr(cmdID),
 				uintptr(unsafe.Pointer(label)),
 			)
 			if ret == 0 {
-				return fmt.Errorf("AppendMenuW item %q failed", item.Label)
+				return fmt.Errorf("AppendMenuW item %q failed", snapshot.label)
 			}
+			t.itemIDs[item.ID()] = cmdID
+			t.itemHMenus[item.ID()] = hmenu
+			t.cmdItems[cmdID] = item
+			pos++
 		}
 	}
+	return nil
+}
+
+// UpdateItem updates a single menu item's native properties in-place via SetMenuItemInfoW.
+// Uses the per-item HMENU handle to correctly update items in submenus.
+// Submenu containers (MF_POPUP items) carry their submenu HMENU in the ID slot
+// instead of a command ID, so they are resolved by position (fByPosition=TRUE).
+func (t *win32Tray) UpdateItem(item *MenuItem) error {
+	return t.updateItem(item.snapshot())
+}
+
+func (t *win32Tray) updateItem(item menuItemSnapshot) error {
+	hmenu, ok := t.itemHMenus[item.id]
+	if !ok || hmenu == 0 {
+		return nil
+	}
+
+	var uItem uintptr
+	byPosition := false
+	if pos, isContainer := t.itemPos[item.id]; isContainer {
+		uItem = uintptr(pos)
+		byPosition = true
+	} else {
+		cmdID, ok := t.itemIDs[item.id]
+		if !ok {
+			return nil
+		}
+		uItem = uintptr(cmdID)
+	}
+
+	label, err := windows.UTF16PtrFromString(item.label)
+	if err != nil {
+		return fmt.Errorf("utf16 label %q: %w", item.label, err)
+	}
+
+	var fState uint32
+	if item.checked {
+		fState |= mfsChecked
+	}
+	if item.disabled {
+		fState |= mfsDisabled
+	}
+
+	mii := menuItemInfoW{
+		cbSize:     uint32(unsafe.Sizeof(menuItemInfoW{})),
+		fMask:      miimString | miimState,
+		fState:     fState,
+		dwTypeData: uintptr(unsafe.Pointer(label)),
+	}
+
+	fByPosition := uintptr(0)
+	if byPosition {
+		fByPosition = 1
+	}
+	ret, _, _ := procSetMenuItemInfoW.Call(hmenu, uItem, fByPosition, uintptr(unsafe.Pointer(&mii)))
+	if ret == 0 {
+		return fmt.Errorf("SetMenuItemInfoW failed for item %q", item.label)
+	}
+
 	return nil
 }
 
@@ -825,12 +924,32 @@ func trayWndProc(hwnd uintptr, msg uint32, wParam, lParam uintptr) uintptr {
 		return ret
 
 	case wmDestroy:
+		trayMu.Lock()
+		delete(trayRegistry, hwnd)
+		lastTray := shouldStopWin32MessageLoop(len(trayRegistry))
+		trayMu.Unlock()
+		if t.hicon != 0 {
+			procDestroyIcon.Call(t.hicon)
+			t.hicon = 0
+		}
+		if t.hmenu != 0 {
+			procDestroyMenu.Call(t.hmenu)
+			t.hmenu = 0
+		}
+		t.hwnd = 0
+		if lastTray {
+			procPostQuitMessage.Call(0)
+		}
 		return 0
 
 	default:
 		ret, _, _ := procDefWindowProcW.Call(hwnd, uintptr(msg), wParam, lParam)
 		return ret
 	}
+}
+
+func shouldStopWin32MessageLoop(remainingTrays int) bool {
+	return remainingTrays == 0
 }
 
 // handleTrayMessage processes the tray callback message.
@@ -898,14 +1017,10 @@ func (t *win32Tray) showContextMenu() {
 	// Return value is non-fatal.
 	_, _, _ = procPostMessageW.Call(t.hwnd, wmNull, 0, 0)
 
-	// Dispatch the selected item (ret is 1-based index from populateMenu).
-	if ret > 0 && t.menu != nil {
-		idx := int(ret) - 1
-		if idx >= 0 && idx < len(t.menu.Items) {
-			item := t.menu.Items[idx]
-			if item.OnClick != nil {
-				item.OnClick()
-			}
+	// Dispatch via globally unique command ID → MenuItem map.
+	if ret > 0 {
+		if item, ok := t.cmdItems[uint32(ret)]; ok && item.OnClick != nil {
+			item.OnClick()
 		}
 	}
 }

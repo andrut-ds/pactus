@@ -63,14 +63,17 @@ type linuxTray struct {
 	props     *prop.Properties
 	menuProps *prop.Properties
 	busName   string
+	trayID    TrayID
 	callbacks *Callbacks
 
 	menu      *Menu
-	menuItems map[int32]*MenuItem // id -> item for Event dispatch
+	menuItems map[int32]*MenuItem // dbus id -> item for Event dispatch
+	itemIDs   map[uint32]int32    // MenuItem.ID() -> dbus menu item ID
 	menuRev   uint32              // layout revision for dbusmenu
 
 	iconPixmap []dbusPixmap // cached ARGB pixmap
 	tooltip    string
+	appName    string // app_name for D-Bus Notify (default: empty)
 	status     string // "Active" or "Passive"
 
 	mu   sync.RWMutex
@@ -82,6 +85,7 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 	return &linuxTray{
 		callbacks: callbacks,
 		menuItems: make(map[int32]*MenuItem),
+		itemIDs:   make(map[uint32]int32),
 		status:    sniStatusPassive,
 		quit:      make(chan struct{}),
 	}
@@ -91,14 +95,17 @@ func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 // the StatusNotifierItem and dbusmenu objects, and registers with the
 // StatusNotifierWatcher.
 func (t *linuxTray) Create() error {
-	conn, err := dbus.SessionBus()
+	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		return fmt.Errorf("connect to session bus: %w", err)
 	}
 	t.conn = conn
 
 	// Request a unique bus name following the SNI convention.
-	t.busName = fmt.Sprintf("org.kde.StatusNotifierItem-%d-1", os.Getpid())
+	// Each tray gets its own private connection and unique bus name suffix,
+	// so multiple trays in the same process don't collide.
+	t.trayID = NewTrayID()
+	t.busName = fmt.Sprintf("org.kde.StatusNotifierItem-%d-%d", os.Getpid(), t.trayID)
 	reply, err := conn.RequestName(t.busName, dbus.NameFlagDoNotQueue)
 	if err != nil {
 		return fmt.Errorf("request bus name %s: %w", t.busName, err)
@@ -376,6 +383,7 @@ func (t *linuxTray) SetMenu(menu *Menu) error {
 	t.mu.Lock()
 	t.menu = menu
 	t.menuItems = make(map[int32]*MenuItem)
+	t.itemIDs = make(map[uint32]int32)
 	if menu != nil {
 		t.buildMenuItemMap(menu.Items, 1)
 	}
@@ -399,12 +407,60 @@ func (t *linuxTray) buildMenuItemMap(items []*MenuItem, nextID int32) int32 {
 	for _, item := range items {
 		id := nextID
 		t.menuItems[id] = item
+		t.itemIDs[item.ID()] = id
 		nextID++
 		if item.Type == MenuItemSubmenu && item.Submenu != nil {
 			nextID = t.buildMenuItemMap(item.Submenu.Items, nextID)
 		}
 	}
 	return nextID
+}
+
+// UpdateItem updates a single menu item's properties and emits ItemsPropertiesUpdated
+// so the desktop environment refreshes the item in-place without a full layout rebuild.
+func (t *linuxTray) UpdateItem(item *MenuItem) error {
+	return t.updateItem(item.snapshot())
+}
+
+func (t *linuxTray) updateItem(item menuItemSnapshot) error {
+	if t.conn == nil {
+		return nil
+	}
+
+	t.mu.RLock()
+	dbusID, ok := t.itemIDs[item.id]
+	t.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+
+	props := make(map[string]dbus.Variant)
+	props["label"] = dbus.MakeVariant(item.label)
+	if item.disabled {
+		props["enabled"] = dbus.MakeVariant(false)
+	} else {
+		props["enabled"] = dbus.MakeVariant(true)
+	}
+	if item.itemType == MenuItemCheckbox {
+		if item.checked {
+			props["toggle-state"] = dbus.MakeVariant(int32(1))
+		} else {
+			props["toggle-state"] = dbus.MakeVariant(int32(0))
+		}
+	}
+	if len(item.icon) > 0 {
+		props["icon-data"] = dbus.MakeVariant(item.icon)
+	}
+
+	updated := []menuItemProps{{ID: dbusID, Props: props}}
+	removed := []menuItemRemovedProps{}
+
+	return t.conn.Emit(menuPath, menuInterface+".ItemsPropertiesUpdated", updated, removed)
+}
+
+// SetAppName sets the application name used in D-Bus Notify calls.
+func (t *linuxTray) SetAppName(name string) {
+	t.appName = name
 }
 
 // ShowNotification displays a desktop notification via org.freedesktop.Notifications.
@@ -415,7 +471,7 @@ func (t *linuxTray) ShowNotification(title, message string) error {
 
 	obj := t.conn.Object(notifInterface, notifPath)
 	call := obj.Call(notifInterface+".Notify", 0,
-		"gogpu-systray",           // app_name
+		t.appName,                 // app_name
 		uint32(0),                 // replaces_id
 		"",                        // app_icon (empty — no icon)
 		title,                     // summary
@@ -567,6 +623,13 @@ type menuItemProps struct {
 	Props map[string]dbus.Variant
 }
 
+// menuItemRemovedProps is used for ItemsPropertiesUpdated removed-properties parameter.
+// D-Bus signature: (ias).
+type menuItemRemovedProps struct {
+	ID    int32
+	Props []string
+}
+
 // menuEvent represents a single event in EventGroup.
 // D-Bus signature: (isvu).
 type menuEvent struct {
@@ -612,7 +675,7 @@ func (m *dbusMenuService) buildLayout(id int32, maxDepth int32, currentDepth int
 		return menuLayout{V0: id, V1: map[string]dbus.Variant{}, V2: nil}
 	}
 
-	props := m.itemProperties(item)
+	props := m.itemProperties(item.snapshot())
 	var children []dbus.Variant
 	if item.Type == MenuItemSubmenu && item.Submenu != nil && maxDepth != 0 {
 		// Find the starting child ID for this submenu.
@@ -634,7 +697,7 @@ func (m *dbusMenuService) buildChildren(items []*MenuItem, startID int32, maxDep
 		id := nextID
 		nextID++
 
-		props := m.itemProperties(item)
+		props := m.itemProperties(item.snapshot())
 		var subChildren []dbus.Variant
 
 		if item.Type == MenuItemSubmenu && item.Submenu != nil {
@@ -672,39 +735,39 @@ func (m *dbusMenuService) findChildStartID(parentID int32) int32 {
 }
 
 // itemProperties converts a MenuItem to dbusmenu properties.
-func (m *dbusMenuService) itemProperties(item *MenuItem) map[string]dbus.Variant {
+func (m *dbusMenuService) itemProperties(item menuItemSnapshot) map[string]dbus.Variant {
 	props := make(map[string]dbus.Variant)
 
-	switch item.Type {
+	switch item.itemType {
 	case MenuItemSeparator:
 		props["type"] = dbus.MakeVariant("separator")
 
 	case MenuItemCheckbox:
-		props["label"] = dbus.MakeVariant(item.Label)
+		props["label"] = dbus.MakeVariant(item.label)
 		props["toggle-type"] = dbus.MakeVariant("checkmark")
-		if item.Checked {
+		if item.checked {
 			props["toggle-state"] = dbus.MakeVariant(int32(1))
 		} else {
 			props["toggle-state"] = dbus.MakeVariant(int32(0))
 		}
-		if item.Disabled {
+		if item.disabled {
 			props["enabled"] = dbus.MakeVariant(false)
 		}
 
 	case MenuItemSubmenu:
-		props["label"] = dbus.MakeVariant(item.Label)
+		props["label"] = dbus.MakeVariant(item.label)
 		props["children-display"] = dbus.MakeVariant("submenu")
-		if item.Disabled {
+		if item.disabled {
 			props["enabled"] = dbus.MakeVariant(false)
 		}
 
 	default: // MenuItemNormal
-		props["label"] = dbus.MakeVariant(item.Label)
-		if item.Disabled {
+		props["label"] = dbus.MakeVariant(item.label)
+		if item.disabled {
 			props["enabled"] = dbus.MakeVariant(false)
 		}
-		if len(item.Icon) > 0 {
-			props["icon-data"] = dbus.MakeVariant(item.Icon)
+		if len(item.icon) > 0 {
+			props["icon-data"] = dbus.MakeVariant(item.icon)
 		}
 	}
 
@@ -733,7 +796,7 @@ func (m *dbusMenuService) GetGroupProperties(ids []int32, propertyNames []string
 		}
 		result = append(result, menuItemProps{
 			ID:    id,
-			Props: m.itemProperties(item),
+			Props: m.itemProperties(item.snapshot()),
 		})
 	}
 

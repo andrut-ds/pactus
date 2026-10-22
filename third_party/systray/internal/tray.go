@@ -21,6 +21,7 @@ type Tray struct {
 	DarkModeIcon []byte
 	TemplateIcon []byte
 	Tooltip      string
+	AppName      string
 	Menu         *Menu
 	Visible      bool
 }
@@ -67,15 +68,31 @@ func (t *Tray) SetTemplateIcon(png []byte) {
 	}
 }
 
+// SetAppName stores the application name used for notifications on Linux
+// (D-Bus org.freedesktop.Notifications app_name parameter). On Windows and
+// macOS, the OS determines the application identity automatically.
+func (t *Tray) SetAppName(name string) {
+	t.AppName = name
+	if setter, ok := t.Platform.(interface{ SetAppName(string) }); ok {
+		setter.SetAppName(name)
+	}
+}
+
 // SetTooltip stores the tooltip and forwards to the platform.
 func (t *Tray) SetTooltip(text string) error {
 	t.Tooltip = text
 	return t.Platform.SetTooltip(text)
 }
 
-// SetMenu stores the menu and forwards to the platform.
+// SetMenu stores the menu, wires the MenuItemUpdater (if supported), and forwards to the platform.
 func (t *Tray) SetMenu(menu *Menu) error {
 	t.Menu = menu
+	switch updater := t.Platform.(type) {
+	case menuItemSnapshotUpdater:
+		setMenuSnapshotUpdater(menu, updater)
+	case MenuItemUpdater:
+		SetMenuUpdater(menu, updater)
+	}
 	return t.Platform.SetMenu(menu)
 }
 

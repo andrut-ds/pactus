@@ -16,6 +16,11 @@ import (
 // NSVariableStatusItemLength tells NSStatusBar to size the item to fit its content.
 const nsVariableStatusItemLength = -1.0
 
+// iconSize is the icon size in points. The menu bar is about 22 points high
+// (24 on notched displays), so an 18 point icon leaves room above and below,
+// like the system icons.
+const iconSize = 18.0
+
 // NSApplicationActivationPolicyAccessory creates an app without dock icon.
 // Systray apps typically run as accessories, not as regular dock-visible apps.
 const nsApplicationActivationPolicyAccessory = 1
@@ -33,6 +38,7 @@ var darwinSels struct {
 	alloc   darwin.SEL
 	init    darwin.SEL
 	release darwin.SEL
+	retain  darwin.SEL
 
 	// NSApplication
 	sharedApplication     darwin.SEL
@@ -42,6 +48,10 @@ var darwinSels struct {
 	finishLaunching       darwin.SEL
 	nextEventMatchingMask darwin.SEL // nextEventMatchingMask:untilDate:inMode:dequeue:
 	sendEvent             darwin.SEL
+
+	// NSRunningApplication
+	currentApplication  darwin.SEL
+	isFinishedLaunching darwin.SEL
 
 	// NSStatusBar
 	systemStatusBar   darwin.SEL
@@ -70,6 +80,10 @@ var darwinSels struct {
 	setSubmenu                  darwin.SEL // setSubmenu:
 	initWithTitleActionKeyEquiv darwin.SEL // initWithTitle:action:keyEquivalent:
 	setState                    darwin.SEL // setState:
+	setEnabled                  darwin.SEL // setEnabled:
+
+	// NSObject main-thread dispatch
+	performSelectorOnMainThread darwin.SEL // performSelectorOnMainThread:withObject:waitUntilDone:
 
 	// NSDate
 	distantPast   darwin.SEL
@@ -89,6 +103,7 @@ var darwinClasses struct {
 	once sync.Once
 
 	NSApplication            darwin.Class
+	NSRunningApplication     darwin.Class
 	NSStatusBar              darwin.Class
 	NSImage                  darwin.Class
 	NSMenu                   darwin.Class
@@ -105,6 +120,7 @@ func initDarwinSels() {
 		darwinSels.alloc = darwin.RegisterSelector("alloc")
 		darwinSels.init = darwin.RegisterSelector("init")
 		darwinSels.release = darwin.RegisterSelector("release")
+		darwinSels.retain = darwin.RegisterSelector("retain")
 
 		// NSApplication
 		darwinSels.sharedApplication = darwin.RegisterSelector("sharedApplication")
@@ -115,6 +131,10 @@ func initDarwinSels() {
 		darwinSels.nextEventMatchingMask = darwin.RegisterSelector(
 			"nextEventMatchingMask:untilDate:inMode:dequeue:")
 		darwinSels.sendEvent = darwin.RegisterSelector("sendEvent:")
+
+		// NSRunningApplication
+		darwinSels.currentApplication = darwin.RegisterSelector("currentApplication")
+		darwinSels.isFinishedLaunching = darwin.RegisterSelector("isFinishedLaunching")
 
 		// NSStatusBar
 		darwinSels.systemStatusBar = darwin.RegisterSelector("systemStatusBar")
@@ -144,6 +164,9 @@ func initDarwinSels() {
 		darwinSels.initWithTitleActionKeyEquiv = darwin.RegisterSelector(
 			"initWithTitle:action:keyEquivalent:")
 		darwinSels.setState = darwin.RegisterSelector("setState:")
+		darwinSels.setEnabled = darwin.RegisterSelector("setEnabled:")
+		darwinSels.performSelectorOnMainThread = darwin.RegisterSelector(
+			"performSelectorOnMainThread:withObject:waitUntilDone:")
 
 		// NSDate
 		darwinSels.distantPast = darwin.RegisterSelector("distantPast")
@@ -163,6 +186,7 @@ func initDarwinSels() {
 func initDarwinClasses() {
 	darwinClasses.once.Do(func() {
 		darwinClasses.NSApplication = darwin.GetClass("NSApplication")
+		darwinClasses.NSRunningApplication = darwin.GetClass("NSRunningApplication")
 		darwinClasses.NSStatusBar = darwin.GetClass("NSStatusBar")
 		darwinClasses.NSImage = darwin.GetClass("NSImage")
 		darwinClasses.NSMenu = darwin.GetClass("NSMenu")
@@ -181,15 +205,16 @@ type darwinTray struct {
 	btn        darwin.ID // NSStatusBarButton (from [statusItem button])
 	nsMenu     darwin.ID // NSMenu attached to the status item
 	target     darwin.ID // GoSystrayTarget instance for click action routing
-	nsApp      darwin.ID // NSApplication shared instance
 
 	callbacks *Callbacks
 	iconData  []byte // stored PNG for recovery after Hide/Show
 
 	// menuActions maps menu item indices to their callbacks.
 	// Populated when SetMenu builds the NSMenu hierarchy.
-	menuActions map[int]func()
-	menuMu      sync.Mutex
+	menuActions    map[int]func()
+	nsItems        map[uint32]darwin.ID // item.ID() -> NSMenuItem handle (incl. submenus)
+	menuMu         sync.Mutex
+	pendingUpdates chan menuItemSnapshot // buffered channel for main-thread dispatch
 }
 
 // goSystrayTargetClass is the custom ObjC class registered once for click handling.
@@ -199,25 +224,63 @@ var (
 	errGoSystrayTargetClass  error
 )
 
-// activeTray is the tray instance receiving callbacks from the ObjC target.
-// Only one systray instance per process on macOS (there is one status bar).
-var activeTray *darwinTray
+// trayRegistry maps GoSystrayTarget ObjC instance pointer to the owning darwinTray.
+// In ObjC callbacks, the `self` parameter identifies which target fired,
+// allowing correct routing when multiple trays exist.
+var (
+	trayRegistryMu  sync.RWMutex
+	trayRegistryMap = make(map[uintptr]*darwinTray)
+	runningNSApp    darwin.ID
+)
 
 // NewPlatformTray creates a macOS system tray implementation.
 func NewPlatformTray(callbacks *Callbacks) PlatformTray {
 	return &darwinTray{
-		callbacks:   callbacks,
-		menuActions: make(map[int]func()),
+		callbacks:      callbacks,
+		menuActions:    make(map[int]func()),
+		nsItems:        make(map[uint32]darwin.ID),
+		pendingUpdates: make(chan menuItemSnapshot, 64),
 	}
+}
+
+// ensureNSApplicationLaunched initializes the shared NSApplication and
+// finishes launching it before any NSStatusItem is created. Creating a
+// status item before the app launch completes crashes with a
+// "CGSConnectionByID" assertion (known macOS pattern: status items must not
+// be created before applicationDidFinishLaunching). All steps are idempotent,
+// safe to call from Create() and Run().
+//
+// When the process has already finished launching, a host application (for
+// example a GTK or Qt app) owns NSApplication. The activation policy is left
+// alone in that case, so the host keeps its Dock icon and main menu.
+func ensureNSApplicationLaunched() {
+	initDarwinSels()
+	initDarwinClasses()
+
+	// Get or create the shared NSApplication.
+	nsApp := darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
+	if nsApp.IsNil() {
+		return
+	}
+
+	if isApplicationFinishedLaunching() {
+		return
+	}
+
+	// Set activation policy to accessory (no dock icon for tray-only apps).
+	nsApp.SendInt(darwinSels.setActivationPolicy, nsApplicationActivationPolicyAccessory)
+
+	// Finish launching is required before the event loop can process events
+	// and before the window-server connection is available for UI objects.
+	nsApp.Send(darwinSels.finishLaunching)
 }
 
 // Create initializes the NSStatusBar item and sets up click handling.
 func (t *darwinTray) Create() error {
-	initDarwinSels()
-	initDarwinClasses()
-
-	// Store as active tray for ObjC callbacks.
-	activeTray = t
+	// NSApplication must be launched before creating the status item;
+	// otherwise AppKit aborts in CGSConnectionByID when the process has no
+	// window-server connection yet.
+	ensureNSApplicationLaunched()
 
 	// Get the system status bar.
 	t.statusBar = darwinClasses.NSStatusBar.Send(darwinSels.systemStatusBar)
@@ -232,9 +295,10 @@ func (t *darwinTray) Create() error {
 		return errors.New("darwin: failed to create NSStatusItem")
 	}
 
-	// statusItemWithLength: returns an autoreleased object. Retain it, or the
-	// status item disappears when the autorelease pool drains.
-	t.statusItem.Send(darwin.RegisterSelector("retain"))
+	// statusItemWithLength: returns an autoreleased object, and the status bar
+	// does not keep it alive. Retain it, or the icon disappears as soon as the
+	// autorelease pool drains (for example inside a GTK main loop).
+	t.statusItem.Send(darwinSels.retain)
 
 	// Get the button associated with the status item.
 	t.btn = t.statusItem.Send(darwinSels.button)
@@ -254,6 +318,11 @@ func (t *darwinTray) Create() error {
 	if t.target.IsNil() {
 		return errors.New("darwin: failed to create GoSystrayTarget")
 	}
+
+	// Register in tray registry so ObjC callbacks can route to this instance.
+	trayRegistryMu.Lock()
+	trayRegistryMap[t.target.Ptr()] = t
+	trayRegistryMu.Unlock()
 
 	// Set the button's target to our GoSystrayTarget instance and its action
 	// to the trayClicked: selector. When the user clicks the status item
@@ -284,8 +353,11 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 		// Add trayClicked: method — called when the status bar button is clicked.
 		// ObjC signature: -(void)trayClicked:(id)sender → "v@:@"
 		trayClickedIMP := ffi.NewCallback(func(self, sel, sender uintptr) uintptr {
-			if activeTray != nil && activeTray.callbacks != nil {
-				if fn := activeTray.callbacks.OnClick; fn != nil {
+			trayRegistryMu.RLock()
+			t := trayRegistryMap[self]
+			trayRegistryMu.RUnlock()
+			if t != nil && t.callbacks != nil {
+				if fn := t.callbacks.OnClick; fn != nil {
 					fn()
 				}
 			}
@@ -297,17 +369,19 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 		// We use the sender's tag to look up the Go callback.
 		// ObjC signature: -(void)menuItemClicked:(NSMenuItem*)sender → "v@:@"
 		menuClickedIMP := ffi.NewCallback(func(self, sel, sender uintptr) uintptr {
-			if activeTray == nil {
+			trayRegistryMu.RLock()
+			t := trayRegistryMap[self]
+			trayRegistryMu.RUnlock()
+			if t == nil {
 				return 0
 			}
-			// Get the tag from the sender: [sender tag]
 			tagSel := darwin.RegisterSelector("tag")
 			tag := darwin.ID(sender).Send(tagSel)
 			idx := int(tag)
 
-			activeTray.menuMu.Lock()
-			fn := activeTray.menuActions[idx]
-			activeTray.menuMu.Unlock()
+			t.menuMu.Lock()
+			fn := t.menuActions[idx]
+			t.menuMu.Unlock()
 
 			if fn != nil {
 				fn()
@@ -315,6 +389,19 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 			return 0
 		})
 		darwin.ClassAddMethod(cls, darwin.RegisterSelector("menuItemClicked:"), menuClickedIMP, "v@:@")
+
+		// Add drainUpdates: method — called on main thread via performSelectorOnMainThread.
+		// Drains the pendingUpdates channel and applies AppKit changes safely.
+		drainUpdatesIMP := ffi.NewCallback(func(self, sel, sender uintptr) uintptr {
+			trayRegistryMu.RLock()
+			t := trayRegistryMap[self]
+			trayRegistryMu.RUnlock()
+			if t != nil {
+				t.applyPendingUpdates()
+			}
+			return 0
+		})
+		darwin.ClassAddMethod(cls, darwin.RegisterSelector("drainUpdates:"), drainUpdatesIMP, "v@:@")
 
 		darwin.RegisterClassPair(cls)
 		goSystrayTargetClass = cls
@@ -324,7 +411,7 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 }
 
 // SetIcon sets the tray icon from PNG bytes.
-// The image is resized to 18x18 points, which fits inside the macOS menu bar.
+// The image is resized to iconSize points, so it fits inside the menu bar.
 func (t *darwinTray) SetIcon(png []byte) error {
 	if t.statusItem.IsNil() || t.btn.IsNil() {
 		return errors.New("darwin: tray not created")
@@ -365,7 +452,7 @@ func (t *darwinTray) SetTemplateIcon(png []byte) error {
 }
 
 // createNSImage creates an NSImage from PNG data, optionally marking it as
-// a template image. The image is resized to 22x22 points.
+// a template image. The image is resized to iconSize points.
 func createNSImage(png []byte, template bool) darwin.ID {
 	initDarwinSels()
 	initDarwinClasses()
@@ -386,8 +473,8 @@ func createNSImage(png []byte, template bool) darwin.ID {
 		return 0
 	}
 
-	// [nsImage setSize:NSMakeSize(18, 18)]
-	nsImage.SendSize(darwinSels.setSize, darwin.NSSize{Width: 18, Height: 18})
+	// [nsImage setSize:NSMakeSize(iconSize, iconSize)]
+	nsImage.SendSize(darwinSels.setSize, darwin.NSSize{Width: iconSize, Height: iconSize})
 
 	// [nsImage setTemplate:YES] if requested
 	if template {
@@ -430,8 +517,9 @@ func (t *darwinTray) SetMenu(menu *Menu) error {
 
 	// Build the NSMenu hierarchy.
 	t.menuMu.Lock()
-	// Clear old actions.
+	// Clear old actions and item handle mappings.
 	t.menuActions = make(map[int]func())
+	t.nsItems = make(map[uint32]darwin.ID)
 	t.menuMu.Unlock()
 
 	counter := menuItemCallbackBaseID
@@ -473,7 +561,8 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 	menuClickedSel := darwin.RegisterSelector("menuItemClicked:")
 
 	for _, item := range menu.Items {
-		switch item.Type {
+		snapshot := item.snapshot()
+		switch snapshot.itemType {
 		case MenuItemSeparator:
 			sep := darwinClasses.NSMenuItem.Send(darwinSels.separatorItem)
 			if !sep.IsNil() {
@@ -482,7 +571,7 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 
 		case MenuItemSubmenu:
 			// Create a placeholder NSMenuItem for the submenu.
-			nsLabel := darwin.NewNSString(item.Label)
+			nsLabel := darwin.NewNSString(snapshot.label)
 			emptyKey := darwin.NewNSString("")
 			nsItem := darwinClasses.NSMenuItem.Send(darwinSels.alloc)
 			nsItem = darwin.MsgSend3Ptr(nsItem, darwinSels.initWithTitleActionKeyEquiv,
@@ -492,19 +581,27 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 			}
 
 			// Build the submenu recursively.
-			subMenu := t.buildNSMenu(item.Label, item.Submenu, counter)
+			subMenu := t.buildNSMenu(snapshot.label, item.Submenu, counter)
 			if !subMenu.IsNil() {
 				nsItem.SendPtr(darwinSels.setSubmenu, subMenu.Ptr())
 			}
 
 			nsMenu.SendPtr(darwinSels.addItem, nsItem.Ptr())
 
+			// Store the submenu container handle for dynamic updates.
+			// Submenu containers are NSMenuItems like any other — users can
+			// call SetLabel/SetDisabled on the *MenuItem returned by
+			// AddSubmenu, so it must be resolvable via nsItems.
+			t.menuMu.Lock()
+			t.nsItems[snapshot.id] = nsItem
+			t.menuMu.Unlock()
+
 		default:
 			// Normal or checkbox item.
 			idx := *counter
 			*counter++
 
-			nsLabel := darwin.NewNSString(item.Label)
+			nsLabel := darwin.NewNSString(snapshot.label)
 			emptyKey := darwin.NewNSString("")
 			nsItem := darwinClasses.NSMenuItem.Send(darwinSels.alloc)
 
@@ -525,30 +622,114 @@ func (t *darwinTray) buildNSMenu(title string, menu *Menu, counter *int) darwin.
 
 			// Set checked state for checkbox items.
 			// NSControlStateValueOn = 1, NSControlStateValueOff = 0
-			if item.Type == MenuItemCheckbox && item.Checked {
+			if snapshot.itemType == MenuItemCheckbox && snapshot.checked {
 				nsItem.SendInt(darwinSels.setState, 1)
 			}
 
 			// Set icon if provided.
-			if len(item.Icon) > 0 {
-				nsImage := createNSImage(item.Icon, false)
+			if len(snapshot.icon) > 0 {
+				nsImage := createNSImage(snapshot.icon, false)
 				if !nsImage.IsNil() {
 					nsItem.SendPtr(darwinSels.setImage, nsImage.Ptr())
 				}
 			}
 
-			// Register Go callback.
+			// Register Go callback and map item ID to NSMenuItem handle for
+			// UpdateItem lookup. itemWithTag: only searches the root menu, so
+			// items inside submenus must be resolved via this map.
+			t.menuMu.Lock()
 			if item.OnClick != nil {
-				t.menuMu.Lock()
 				t.menuActions[idx] = item.OnClick
-				t.menuMu.Unlock()
 			}
+			t.nsItems[snapshot.id] = nsItem
+			t.menuMu.Unlock()
 
 			nsMenu.SendPtr(darwinSels.addItem, nsItem.Ptr())
 		}
 	}
 
 	return nsMenu
+}
+
+// UpdateItem dispatches a menu item update to the main thread.
+// AppKit requires all UI mutations on the main thread. We enqueue the snapshot
+// and call performSelectorOnMainThread to drain the queue safely.
+func (t *darwinTray) UpdateItem(item *MenuItem) error {
+	return t.updateItem(item.snapshot())
+}
+
+func (t *darwinTray) updateItem(item menuItemSnapshot) error {
+	if t.nsMenu.IsNil() || t.target.IsNil() {
+		return nil
+	}
+
+	t.menuMu.Lock()
+	_, ok := t.nsItems[item.id]
+	t.menuMu.Unlock()
+	if !ok {
+		return nil
+	}
+
+	// Queue the captured state for main-thread processing.
+	t.pendingUpdates <- item
+
+	// Dispatch to main thread: [target performSelectorOnMainThread:@selector(drainUpdates:) withObject:nil waitUntilDone:YES]
+	drainSel := darwin.RegisterSelector("drainUpdates:")
+	darwin.MsgSend3Ptr(t.target, darwinSels.performSelectorOnMainThread,
+		uintptr(drainSel), 0, 1) // waitUntilDone:YES
+
+	return nil
+}
+
+// applyPendingUpdates drains the pendingUpdates channel and applies AppKit
+// changes. MUST be called on the main thread (via drainUpdates: ObjC callback).
+// A snapshot with a zero ID signals Destroy.
+func (t *darwinTray) applyPendingUpdates() {
+	for {
+		select {
+		case item := <-t.pendingUpdates:
+			if item.id == 0 {
+				t.destroyOnMainThread()
+				return
+			}
+			t.applyItemUpdate(item)
+		default:
+			return
+		}
+	}
+}
+
+// applyItemUpdate applies a single snapshot to its NSMenuItem.
+// MUST be called on the main thread.
+func (t *darwinTray) applyItemUpdate(item menuItemSnapshot) {
+	t.menuMu.Lock()
+	nsItem, ok := t.nsItems[item.id]
+	t.menuMu.Unlock()
+	if !ok || nsItem.IsNil() {
+		return
+	}
+
+	nsTitle := darwin.NewNSString(item.label)
+	if !nsTitle.IsNil() {
+		nsItem.SendPtr(darwinSels.setTitle, nsTitle.Ptr())
+	}
+
+	if item.itemType == MenuItemCheckbox {
+		state := int64(0)
+		if item.checked {
+			state = 1
+		}
+		nsItem.SendInt(darwinSels.setState, state)
+	}
+
+	nsItem.SendBool(darwinSels.setEnabled, !item.disabled)
+
+	if len(item.icon) > 0 {
+		nsImage := createNSImage(item.icon, false)
+		if !nsImage.IsNil() {
+			nsItem.SendPtr(darwinSels.setImage, nsImage.Ptr())
+		}
+	}
 }
 
 // ShowNotification displays an OS-level notification using NSUserNotification.
@@ -606,8 +787,7 @@ func (t *darwinTray) Show() error {
 	if t.statusItem.IsNil() {
 		return errors.New("darwin: failed to re-create NSStatusItem")
 	}
-
-	t.statusItem.Send(darwin.RegisterSelector("retain"))
+	t.statusItem.Send(darwinSels.retain)
 
 	t.btn = t.statusItem.Send(darwinSels.button)
 
@@ -642,6 +822,7 @@ func (t *darwinTray) Hide() error {
 
 	// [statusBar removeStatusItem:statusItem]
 	t.statusBar.SendPtr(darwinSels.removeStatusItem, t.statusItem.Ptr())
+	t.statusItem.Send(darwinSels.release)
 	t.statusItem = 0
 	t.btn = 0
 
@@ -657,37 +838,86 @@ func (t *darwinTray) Bounds() (int, int, int, int) {
 	return 0, 0, 0, 0
 }
 
-// Run blocks the calling goroutine, running the Cocoa event loop.
-// If NSApplication is already initialized (e.g., systray is used inside a gogpu
-// app), this runs a local event polling loop instead of calling [NSApp run].
+// Run blocks the calling goroutine, running the Cocoa event loop ([NSApp run]).
+// It returns when the loop is stopped after the last tray's Destroy() has run.
+// Only call Run() once per process: the shared NSApplication event loop serves
+// all tray icons.
 func (t *darwinTray) Run() error {
 	initDarwinSels()
 	initDarwinClasses()
 
 	// Get or create the shared NSApplication.
-	t.nsApp = darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
-	if t.nsApp.IsNil() {
+	nsApp := darwinClasses.NSApplication.Send(darwinSels.sharedApplication)
+	if nsApp.IsNil() {
 		return errors.New("darwin: failed to get NSApplication")
 	}
-
-	// Set activation policy to accessory (no dock icon for tray-only apps).
-	t.nsApp.SendInt(darwinSels.setActivationPolicy, nsApplicationActivationPolicyAccessory)
+	trayRegistryMu.Lock()
+	runningNSApp = nsApp
+	trayRegistryMu.Unlock()
 
 	// Finish launching is required before the event loop can process events.
-	t.nsApp.Send(darwinSels.finishLaunching)
+	ensureNSApplicationLaunched()
 
-	// Run the Cocoa event loop. This blocks until the app terminates.
+	// Run the Cocoa event loop. This blocks until [NSApp stop:] is sent and
+	// the wake event posted by Destroy() is processed.
 	// [NSApp run]
-	t.nsApp.Send(darwinSels.run)
+	nsApp.Send(darwinSels.run)
+
+	trayRegistryMu.Lock()
+	if runningNSApp == nsApp {
+		runningNSApp = 0
+	}
+	trayRegistryMu.Unlock()
 
 	return nil
 }
 
 // Destroy releases all resources associated with the tray icon.
+// Safe to call from any goroutine, and never blocks the caller. The AppKit
+// cleanup and the event-loop stop are executed on the main thread
+// (drainUpdates:), so the ordering is deterministic:
+//
+//	final cleanup → [NSApp stop:] → wake event → [NSApp run] returns → Run() returns
+//
+// The drain is dispatched with waitUntilDone:NO because Destroy must never
+// block: if the shared event loop has already exited (e.g. another tray was
+// removed first), the performSelector would never be serviced and a blocking
+// wait would hang the caller. While the loop is running, the drain is
+// serviced before the wake event it posts, so cleanup always completes before
+// Run() returns.
 func (t *darwinTray) Destroy() {
+	if t.target.IsNil() {
+		return
+	}
+
+	// Queue cleanup for main thread execution.
+	t.pendingUpdates <- menuItemSnapshot{} // zero ID sentinel signals destroy
+
+	// Dispatch cleanup to main thread. waitUntilDone:NO.
+	drainSel := darwin.RegisterSelector("drainUpdates:")
+	darwin.MsgSend3Ptr(t.target, darwinSels.performSelectorOnMainThread,
+		uintptr(drainSel), 0, 0) // waitUntilDone:NO
+}
+
+// destroyOnMainThread performs the actual AppKit cleanup.
+// MUST be called on the main thread.
+func (t *darwinTray) destroyOnMainThread() {
 	// Remove the status item from the menu bar.
 	if !t.statusBar.IsNil() && !t.statusItem.IsNil() {
 		t.statusBar.SendPtr(darwinSels.removeStatusItem, t.statusItem.Ptr())
+		t.statusItem.Send(darwinSels.release)
+	}
+
+	// Unregister from tray registry before releasing the target. Only the final
+	// tray owns shutdown of the shared application event loop.
+	lastTray := false
+	var nsApp darwin.ID
+	if !t.target.IsNil() {
+		trayRegistryMu.Lock()
+		delete(trayRegistryMap, t.target.Ptr())
+		lastTray = shouldStopDarwinApplication(len(trayRegistryMap))
+		nsApp = runningNSApp
+		trayRegistryMu.Unlock()
 	}
 
 	// Release ObjC objects.
@@ -700,10 +930,29 @@ func (t *darwinTray) Destroy() {
 	t.btn = 0
 	t.nsMenu = 0
 
-	// Stop the run loop if we started it.
-	if !t.nsApp.IsNil() {
-		t.nsApp.SendPtr(darwinSels.stop, 0)
+	// Stop the shared application and wake its event loop with a real event.
+	// [NSApp run] only re-checks the stop flag after processing an event; a
+	// bare CFRunLoopStop wake is insufficient (verified on macOS 14-26).
+	// stop: is thread-safe, and postEvent:atStart:YES delivers the wake event
+	// at the head of the queue (gogpu reference pattern).
+	if lastTray && !nsApp.IsNil() {
+		nsApp.SendPtr(darwinSels.stop, 0)
+		darwin.PostAppDefinedEvent(nsApp)
+	}
+}
+
+// isApplicationFinishedLaunching reports whether the current process has
+// finished launching: [[NSRunningApplication currentApplication] isFinishedLaunching].
+func isApplicationFinishedLaunching() bool {
+	app := darwinClasses.NSRunningApplication.Send(darwinSels.currentApplication)
+	if app.IsNil() {
+		return false
 	}
 
-	activeTray = nil
+	// BOOL is returned in the low byte.
+	return app.Send(darwinSels.isFinishedLaunching)&0xff != 0
+}
+
+func shouldStopDarwinApplication(remainingTrays int) bool {
+	return remainingTrays == 0
 }

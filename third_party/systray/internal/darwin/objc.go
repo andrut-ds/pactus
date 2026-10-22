@@ -191,7 +191,7 @@ func GetClass(name string) Class {
 		name: namePtr,
 	}
 
-	err := ffi.CallFunction(
+	_, err := ffi.CallFunction(
 		rt.cifSelector,
 		rt.objcGetClass,
 		unsafe.Pointer(&result),
@@ -222,7 +222,7 @@ func RegisterSelector(name string) SEL {
 		name: namePtr,
 	}
 
-	err := ffi.CallFunction(
+	_, err := ffi.CallFunction(
 		rt.cifSelector,
 		rt.selRegisterName,
 		unsafe.Pointer(&result),
@@ -254,7 +254,7 @@ func (id ID) Send(sel SEL) ID {
 		cmd:  uintptr(sel),
 	}
 
-	err := ffi.CallFunction(
+	_, err := ffi.CallFunction(
 		rt.cifVoidPtr,
 		rt.objcMsgSend,
 		unsafe.Pointer(&result),
@@ -328,7 +328,7 @@ func msgSend(self ID, sel SEL, args ...uintptr) ID {
 	}
 
 	var result uintptr
-	err = ffi.CallFunction(
+	_, err = ffi.CallFunction(
 		cif,
 		rt.objcMsgSend,
 		unsafe.Pointer(&result),
@@ -404,7 +404,7 @@ func (id ID) SendSize(sel SEL, size NSSize) ID {
 	}
 
 	var result uintptr
-	err = ffi.CallFunction(
+	_, err = ffi.CallFunction(
 		cif,
 		rt.objcMsgSend,
 		unsafe.Pointer(&result),
@@ -461,7 +461,7 @@ func (id ID) SendDouble(sel SEL, arg float64) ID {
 	}
 
 	var result uintptr
-	err = ffi.CallFunction(
+	_, err = ffi.CallFunction(
 		cif,
 		rt.objcMsgSend,
 		unsafe.Pointer(&result),
@@ -499,7 +499,7 @@ func MsgSend3Ptr(id ID, sel SEL, arg0, arg1, arg2 uintptr) ID {
 	cmd := uintptr(sel)
 
 	var result uintptr
-	if err := ffi.CallFunction(cif,
+	if _, err := ffi.CallFunction(cif,
 		rt.objcMsgSend,
 		unsafe.Pointer(&result),
 		[]unsafe.Pointer{
@@ -548,7 +548,7 @@ func AllocateClassPair(superclass Class, name string) Class {
 	var extraBytes uintptr
 
 	var result uintptr
-	if err := ffi.CallFunction(cif,
+	if _, err := ffi.CallFunction(cif,
 		rt.objcAllocateClassPair,
 		unsafe.Pointer(&result),
 		[]unsafe.Pointer{
@@ -590,7 +590,7 @@ func ClassAddMethod(cls Class, sel SEL, imp uintptr, typeEncoding string) bool {
 	typePtr := uintptr(unsafe.Pointer(&typeBytes[0]))
 
 	var result uintptr
-	if err := ffi.CallFunction(cif,
+	if _, err := ffi.CallFunction(cif,
 		rt.classAddMethod,
 		unsafe.Pointer(&result),
 		[]unsafe.Pointer{
@@ -622,7 +622,7 @@ func RegisterClassPair(cls Class) {
 	}
 
 	clsPtr := uintptr(cls)
-	_ = ffi.CallFunction(cif,
+	_, _ = ffi.CallFunction(cif,
 		rt.objcRegisterClassPair,
 		nil,
 		[]unsafe.Pointer{
@@ -679,4 +679,100 @@ func NewNSData(data []byte) ID {
 		uintptr(unsafe.Pointer(&data[0])),
 		uintptr(len(data)),
 	)
+}
+
+// PostAppDefinedEvent creates an NSEvent of type NSApplicationDefined and
+// posts it to the application's event queue via [NSApp postEvent:atStart:YES].
+//
+// This is the wake-up mechanism for [NSApp run]: the run loop only re-checks
+// the stop flag after dequeuing and processing a real event, so terminating
+// the loop requires delivering one (a bare CFRunLoopStop wake is not enough;
+// see darwinTray.Destroy). postEvent:atStart: is thread-safe per AppKit
+// documentation, and the application retains the posted event, so no release
+// is needed here.
+func PostAppDefinedEvent(app ID) {
+	if app == 0 {
+		return
+	}
+	if err := initRuntime(); err != nil {
+		return
+	}
+
+	nsEventClass := GetClass("NSEvent")
+	if nsEventClass == 0 {
+		return
+	}
+
+	selOther := RegisterSelector(
+		"otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:")
+	selPost := RegisterSelector("postEvent:atStart:")
+
+	// NSEventTypeApplicationDefined = 15. otherEventWithType: rejects types
+	// outside its "weird" set (NSInternalInconsistencyException otherwise).
+	const nsEventTypeApplicationDefined = 15
+
+	// +[NSEvent otherEventWithType:...] — argument types match the Apple
+	// header (and gogpu's createApplicationDefinedEvent reference): type and
+	// modifierFlags are NSUInteger (uint64), windowNumber/data1/data2 are
+	// NSInteger (int64), subtype is short (int16), and location is an NSPoint
+	// (16-byte HFA of two doubles — same layout as NSSize, see nsSizeType).
+	argTypes := []*types.TypeDescriptor{
+		types.PointerTypeDescriptor, // self (NSEvent class)
+		types.PointerTypeDescriptor, // _cmd (SEL)
+		types.UInt64TypeDescriptor,  // type (NSUInteger)
+		nsSizeType,                  // location (NSPoint)
+		types.UInt64TypeDescriptor,  // modifierFlags (NSUInteger)
+		types.DoubleTypeDescriptor,  // timestamp (NSTimeInterval)
+		types.SInt64TypeDescriptor,  // windowNumber (NSInteger)
+		types.PointerTypeDescriptor, // context (NSGraphicsContext*)
+		types.SInt16TypeDescriptor,  // subtype (short)
+		types.SInt64TypeDescriptor,  // data1 (NSInteger)
+		types.SInt64TypeDescriptor,  // data2 (NSInteger)
+	}
+
+	cif := &types.CallInterface{}
+	if err := ffi.PrepareCallInterface(cif, types.DefaultCall,
+		types.PointerTypeDescriptor, argTypes); err != nil {
+		return
+	}
+
+	argBox := &struct {
+		self    uintptr
+		sel     uintptr
+		typ     uint64
+		loc     NSSize
+		flags   uint64
+		ts      float64
+		window  int64
+		context uintptr
+		subtype int16
+		data1   int64
+		data2   int64
+	}{
+		self: uintptr(nsEventClass),
+		sel:  uintptr(selOther),
+		typ:  nsEventTypeApplicationDefined,
+	}
+
+	var ev uintptr
+	if _, err := ffi.CallFunction(cif, rt.objcMsgSend, unsafe.Pointer(&ev), []unsafe.Pointer{
+		unsafe.Pointer(&argBox.self),
+		unsafe.Pointer(&argBox.sel),
+		unsafe.Pointer(&argBox.typ),
+		unsafe.Pointer(&argBox.loc),
+		unsafe.Pointer(&argBox.flags),
+		unsafe.Pointer(&argBox.ts),
+		unsafe.Pointer(&argBox.window),
+		unsafe.Pointer(&argBox.context),
+		unsafe.Pointer(&argBox.subtype),
+		unsafe.Pointer(&argBox.data1),
+		unsafe.Pointer(&argBox.data2),
+	}); err != nil || ev == 0 {
+		return
+	}
+
+	// [app postEvent:event atStart:YES] — atStart:YES puts the wake event at
+	// the head of the event queue so the loop stops immediately (gogpu
+	// reference pattern).
+	msgSend(app, selPost, ev, 1)
 }

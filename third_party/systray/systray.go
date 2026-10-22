@@ -54,15 +54,27 @@ func (t *SystemTray) SetTemplateIcon(png []byte) *SystemTray {
 	return t
 }
 
+// SetAppName sets the application name used in notifications on Linux.
+// On Windows and macOS, the OS determines the application identity automatically.
+func (t *SystemTray) SetAppName(name string) *SystemTray {
+	t.impl.SetAppName(name)
+	return t
+}
+
 // SetTooltip sets the hover tooltip text.
 func (t *SystemTray) SetTooltip(text string) *SystemTray {
 	_ = t.impl.SetTooltip(text)
 	return t
 }
 
-// SetMenu attaches a context menu to the tray icon.
+// SetMenu attaches a context menu to the tray icon. Pass nil to remove the
+// current menu.
 func (t *SystemTray) SetMenu(menu *Menu) *SystemTray {
-	_ = t.impl.SetMenu(menu.impl)
+	var internalMenu *internal.Menu
+	if menu != nil {
+		internalMenu = menu.impl
+	}
+	_ = t.impl.SetMenu(internalMenu)
 	return t
 }
 

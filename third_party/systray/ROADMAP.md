@@ -4,20 +4,32 @@
 
 ---
 
-## Current State: v0.1.0
+## Current State: v0.2.0
 
-✅ **All three platforms implemented:**
+All three platforms implemented and production-ready:
 
-- **Windows** — Shell_NotifyIconW, context menus, balloon notifications, dark mode auto-switching, explorer crash recovery
-- **macOS** — NSStatusBar/NSStatusItem via goffi ObjC runtime, template icons, NSMenu, NSUserNotification
-- **Linux** — D-Bus StatusNotifierItem (SNI) via godbus, com.canonical.dbusmenu, org.freedesktop.Notifications, watcher re-registration
-- **Public API** — builder pattern, multiple trays, click/doubleclick/rightclick handlers
-- **72 tests**, 84% coverage on public API
+- **Windows** — Shell_NotifyIconW, context menus, balloon notifications, dark mode auto-switching, explorer crash recovery, dynamic menu updates via SetMenuItemInfoW
+- **macOS** — NSStatusBar/NSStatusItem via goffi ObjC runtime, template icons, NSMenu, NSUserNotification, per-instance callback routing, dynamic menu updates via NSMenuItem setTitle/setState/setEnabled
+- **Linux** — D-Bus StatusNotifierItem (SNI) via godbus, com.canonical.dbusmenu, org.freedesktop.Notifications, watcher re-registration, private D-Bus connection per tray, ItemsPropertiesUpdated for dynamic updates
+- **Public API** — builder pattern, multiple trays, click/doubleclick/rightclick handlers, dynamic menu updates (SetLabel/SetChecked/SetDisabled/SetIcon)
+- **86 tests**, 85% coverage on public API
 
-### Recent Highlights
+### Release History
 
 | Version | Date | Key Changes |
 |---------|------|-------------|
+| **v0.3.0** | 2026-08-30 | SetAppName (#35), SetMenu(nil) (#29), multi-tray lifecycle (#30), macOS CGS crash (#33), race fix (#31) |
+| **v0.2.8** | 2026-08-06 | Windows submenu container UpdateItem: position-based lookup (PR #27 by @nange) |
+| **v0.2.7** | 2026-08-06 | macOS submenu UpdateItem: nsItems map replaces itemWithTag (PR #24 by @nange) |
+| **v0.2.6** | 2026-08-05 | macOS Run() exit: PostAppDefinedEvent (PR #21 by @nange) |
+| **v0.2.5** | 2026-08-05 | macOS Run() exit attempt: stop+CFRunLoopStop |
+| **v0.2.4** | 2026-08-05 | Fix Run() exit: Windows WM_DESTROY cleanup ordering, macOS CFRunLoopStop wake |
+| **v0.2.3** | 2026-08-05 | Fix Destroy() from background goroutine (Windows PostMessage, macOS main thread dispatch) |
+| **v0.2.2** | 2026-08-05 | Fix Windows submenu dispatch, UpdateItem on submenus, Run() exit; IsChecked/IsDisabled getters |
+| **v0.2.1** | 2026-07-28 | Fix macOS crash on background goroutine menu updates (main thread dispatch) |
+| **v0.2.0** | 2026-07-27 | Multi-tray fix (macOS/Linux), dynamic menu updates, breaking API (Add returns *MenuItem) |
+| **v0.1.2** | 2026-07-12 | deps: goffi v0.6.0, x/sys v0.47.0 |
+| **v0.1.1** | 2026-06-25 | deps: goffi v0.5.5, godbus v5.2.2 |
 | **v0.1.0** | 2026-04-30 | Initial release — all 3 platforms, menus, notifications, dark mode, 72 tests |
 
 ---
@@ -47,7 +59,7 @@
 - [ ] Notification actions (buttons, reply field)
 - [ ] Notification images/icons
 - [ ] Menu item icons on all platforms
-- [ ] Dynamic menu updates (add/remove items at runtime)
+- [x] ~~Dynamic menu updates (add/remove items at runtime)~~ — shipped in v0.2.0
 - [ ] Accessibility — screen reader support for tray menus
 - [ ] Tray icon animation (rotating/pulsing for attention)
 
@@ -73,7 +85,7 @@ internal/platform_linux.go      D-Bus StatusNotifierItem
 internal/darwin/objc.go         ObjC runtime wrapper
 ```
 
-Follows Qt6 `QPlatformSystemTrayIcon` three-layer pattern (ADR-011).
+Follows Qt6 `QPlatformSystemTrayIcon` three-layer pattern.
 
 ---
 
