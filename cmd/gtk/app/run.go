@@ -204,46 +204,17 @@ func (g *GUI) Cleanup() {
 }
 
 // createTray creates a system tray icon with Show and Exit menu items.
-// The tray runs its event loop in a background goroutine.
 func createTray(mwView *view.MainWindowView, gtkApp *gtk.Application) *systray.SystemTray {
 	// On macOS, the status item must be created on the main thread, which GTK
-	// owns, and creating it here crashes the app. Skip the tray and let the
-	// close button quit, so the hidden window is never left without a way back.
+	// owns. GTK also runs the Cocoa event loop there, so the tray needs no
+	// event loop of its own.
 	if runtime.GOOS == "darwin" {
-		gtkutil.IdleAddSync(func() {
-			mwView.HideOnClose = false
+		return gtkutil.IdleAddSyncT(func() *systray.SystemTray {
+			return newTray(mwView, gtkApp)
 		})
-
-		return nil
 	}
 
-	trayIcon := systray.New()
-
-	menu := systray.NewMenu()
-	menu.Add("Show", func() {
-		gtkutil.IdleAddSync(func() {
-			mwView.Window.Present()
-		})
-	})
-	menu.AddSeparator()
-	menu.Add("Exit", func() {
-		gtkutil.IdleAddSync(func() {
-			mwView.HideOnClose = false
-			gtkApp.Quit()
-		})
-	})
-
-	trayIcon.
-		SetIcon(assets.ImagePactusTrayDark32Data).
-		SetTooltip("Pactus GUI").
-		SetMenu(menu).
-		OnClick(func() {
-			gtkutil.IdleAddSync(func() {
-				mwView.Window.Present()
-			})
-		})
-
-	trayIcon.Show()
+	trayIcon := newTray(mwView, gtkApp)
 
 	// Run the tray event loop in a background goroutine.
 	go func() {
@@ -251,6 +222,48 @@ func createTray(mwView *view.MainWindowView, gtkApp *gtk.Application) *systray.S
 			gtkutil.Logf("System tray error: %v", err)
 		}
 	}()
+
+	return trayIcon
+}
+
+// newTray builds the tray icon and its menu.
+// The callbacks run on the main thread on macOS, so they must not wait for
+// the GTK main loop.
+func newTray(mwView *view.MainWindowView, gtkApp *gtk.Application) *systray.SystemTray {
+	trayIcon := systray.New()
+
+	menu := systray.NewMenu()
+	menu.Add("Show", func() {
+		gtkutil.IdleAddAsync(func() {
+			mwView.Window.Present()
+		})
+	})
+	menu.AddSeparator()
+	menu.Add("Exit", func() {
+		gtkutil.IdleAddAsync(func() {
+			mwView.HideOnClose = false
+			gtkApp.Quit()
+		})
+	})
+
+	// macOS tints template icons to match the menu bar, so the white icon
+	// stays visible on a light menu bar.
+	if runtime.GOOS == "darwin" {
+		trayIcon.SetTemplateIcon(assets.ImagePactusTrayDark32Data)
+	} else {
+		trayIcon.SetIcon(assets.ImagePactusTrayDark32Data)
+	}
+
+	trayIcon.
+		SetTooltip("Pactus GUI").
+		SetMenu(menu).
+		OnClick(func() {
+			gtkutil.IdleAddAsync(func() {
+				mwView.Window.Present()
+			})
+		})
+
+	trayIcon.Show()
 
 	return trayIcon
 }
