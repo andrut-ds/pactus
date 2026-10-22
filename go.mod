@@ -190,3 +190,5 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 	modernc.org/sqlite v1.59.0 // indirect
 )
+
+replace github.com/gogpu/systray => ./third_party/systray
