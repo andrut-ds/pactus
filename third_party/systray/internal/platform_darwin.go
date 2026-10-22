@@ -324,7 +324,7 @@ func registerGoSystrayTarget() (darwin.Class, error) {
 }
 
 // SetIcon sets the tray icon from PNG bytes.
-// The image is resized to 22x22 points, the standard macOS menu bar icon size.
+// The image is resized to 18x18 points, which fits inside the macOS menu bar.
 func (t *darwinTray) SetIcon(png []byte) error {
 	if t.statusItem.IsNil() || t.btn.IsNil() {
 		return errors.New("darwin: tray not created")
@@ -386,8 +386,8 @@ func createNSImage(png []byte, template bool) darwin.ID {
 		return 0
 	}
 
-	// [nsImage setSize:NSMakeSize(22, 22)] — standard menu bar icon size
-	nsImage.SendSize(darwinSels.setSize, darwin.NSSize{Width: 22, Height: 22})
+	// [nsImage setSize:NSMakeSize(18, 18)]
+	nsImage.SendSize(darwinSels.setSize, darwin.NSSize{Width: 18, Height: 18})
 
 	// [nsImage setTemplate:YES] if requested
 	if template {
